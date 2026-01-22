@@ -14,6 +14,8 @@ class Keys:
     ADJ: str = "spatial_distances"
     ADJ_LOCAL: str = "spatial_distances_local"
     ADJ_VIEW: str = "spatial_distances_view"
+    TOPK_NEIGHBOR_INDICES: str = "topk_neighbor_indices"
+    TOPK_NEIGHBOR_DISTANCES: str = "topk_neighbor_distances"
 
     # var keys
     VAR_MEAN: str = "mean"
@@ -63,3 +65,7 @@ class Nums:
     LAZY_LOADING_SIZE_THRESHOLD: int = 500_000_000  # use lazy loading above this number (here, 1M cells * 500 genes)
     RATIO_VALID_CELLS_TH: float = 0.7
     HE_PATCH_WIDTH: int = 224
+
+    # neighborhood sampling constants
+    K_P: int = 8
+    SIGMA: float = CELLS_CHARACTERISTIC_DISTANCE

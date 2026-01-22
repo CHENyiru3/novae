@@ -29,5 +29,21 @@ class Settings:
     def warmup_epochs(self, value: int):
         Nums.WARMUP_EPOCHS = value
 
+    @property
+    def k_p(self) -> int:
+        return Nums.K_P
+
+    @k_p.setter
+    def k_p(self, value: int) -> None:
+        Nums.K_P = value
+
+    @property
+    def sigma(self) -> float:
+        return Nums.SIGMA
+
+    @sigma.setter
+    def sigma(self, value: float) -> None:
+        Nums.SIGMA = value
+
 
 settings = Settings()
