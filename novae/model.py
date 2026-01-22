@@ -19,7 +19,7 @@ from torch_geometric.data import Batch
 from . import __version__, plot, settings, utils
 from ._constants import Keys, Nums
 from .data import NovaeDatamodule, NovaeDataset, _load_wandb_artifact
-from .module import CellEmbedder, GraphAugmentation, GraphEncoder, SwavHead, coupling_loss
+from .module import CellEmbedder, DualSwavHead, GraphAugmentation, GraphEncoder
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +56,8 @@ class Novae(L.LightningModule, PyTorchModelHubMixin):
         num_layers: int = 10,
         batch_size: int = 256,
         num_prototypes: int = 512,
+        swav_loss_weight_intrinsic: float = 1.0,
+        swav_loss_weight_niche: float = 1.0,
         panel_subset_size: float = 0.8,
         background_noise_lambda: float = 8.0,
         sensitivity_noise_std: float = 0.05,
@@ -87,6 +89,8 @@ class Novae(L.LightningModule, PyTorchModelHubMixin):
             num_layers: Number of layers for the graph encoder.
             batch_size: Mini-batch size.
             num_prototypes: Number of prototypes (`K` in the article).
+            swav_loss_weight_intrinsic: Weight for the intrinsic SwAV loss.
+            swav_loss_weight_niche: Weight for the niche SwAV loss.
             panel_subset_size: Ratio of genes kept from the panel during augmentation.
             background_noise_lambda: Parameter of the exponential distribution for the noise augmentation.
             sensitivity_noise_std: Standard deviation for the multiplicative for for the noise augmentation.
@@ -123,7 +127,14 @@ class Novae(L.LightningModule, PyTorchModelHubMixin):
         self.augmentation = GraphAugmentation(
             panel_subset_size, background_noise_lambda, sensitivity_noise_std, dropout_rate
         )
-        self.swav_head = SwavHead(self.mode, output_size, num_prototypes, temperature)
+        self.swav_head = DualSwavHead(
+            self.mode,
+            output_size,
+            num_prototypes,
+            num_prototypes,
+            temperature,
+            temperature,
+        )
 
         ### Misc
         self._num_workers = 0
@@ -160,7 +171,7 @@ class Novae(L.LightningModule, PyTorchModelHubMixin):
             self._prepare_adatas(utils.get_reference(adata, reference)), sample_cells=Nums.DEFAULT_SAMPLE_CELLS
         )
         latent = self._compute_representations_datamodule(None, datamodule, return_representations=True)
-        self.swav_head._prototypes = self.swav_head.compute_kmeans_prototypes(latent)
+        self.swav_head.init_prototypes(latent)
 
     def __repr__(self) -> str:
         info_dict: dict[str, int | str | bool | None] = {
@@ -278,20 +289,14 @@ class Novae(L.LightningModule, PyTorchModelHubMixin):
         z_dict: dict[str, Tensor] = self(batch)
         slide_id = batch["main"].get("slide_id", [None])[0]
 
-        swav_loss, mean_entropy_normalized = self.swav_head.forward(z_dict["main"], z_dict["view"], slide_id)
-        coupling_loss_value = self._maybe_compute_coupling_loss(batch, z_dict)
-        loss = swav_loss + (self.hparams.lambda_couple * coupling_loss_value)
+        loss_c, loss_n, entropy_c, entropy_n = self.swav_head.forward(z_dict["main"], z_dict["view"], slide_id)
+        loss = self.hparams.swav_loss_weight_intrinsic * loss_c + self.hparams.swav_loss_weight_niche * loss_n
 
         self._log_progress_bar("loss", loss)
-        self._log_progress_bar("entropy", mean_entropy_normalized, on_epoch=False)
-        self.log(
-            "train/swav_loss",
-            swav_loss,
-            on_epoch=True,
-            on_step=True,
-            batch_size=self.hparams.batch_size,
-            prog_bar=False,
-        )
+        self._log_progress_bar("swav_loss_intrinsic", loss_c, on_epoch=False)
+        self._log_progress_bar("swav_loss_niche", loss_n, on_epoch=False)
+        self._log_progress_bar("entropy_intrinsic", entropy_c, on_epoch=False, prog_bar=False)
+        self._log_progress_bar("entropy_niche", entropy_n, on_epoch=False, prog_bar=False)
 
         return loss
 
@@ -464,7 +469,7 @@ class Novae(L.LightningModule, PyTorchModelHubMixin):
         self.datamodule.dataset.shuffle_obs_ilocs()
 
         after_warm_up = self.current_epoch >= Nums.WARMUP_EPOCHS
-        self.swav_head.prototypes.requires_grad_(after_warm_up or self.mode.pretrained)
+        self.swav_head.set_prototypes_requires_grad(after_warm_up or self.mode.pretrained)
 
     def _log_progress_bar(self, name: str, value: float, on_epoch: bool = True, prog_bar: bool = True, **kwargs):
         self.log(
@@ -596,7 +601,7 @@ class Novae(L.LightningModule, PyTorchModelHubMixin):
         adatas_refs = [adatas_refs] if isinstance(adatas_refs, AnnData) else adatas_refs
 
         latent = np.concatenate([adata.obsm[Keys.REPR][utils.valid_indices(adata)] for adata in adatas_refs])
-        self.swav_head._kmeans_prototypes = self.swav_head.compute_kmeans_prototypes(latent)
+        self.swav_head.set_kmeans_prototypes(latent)
         self.swav_head.reset_clustering(only_zero_shot=True)
 
         for adata in adatas:

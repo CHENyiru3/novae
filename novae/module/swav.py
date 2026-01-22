@@ -197,6 +197,12 @@ class SwavHead(L.LightningModule):
 
         return torch.nn.Parameter(torch.tensor(kmeans_prototypes))
 
+    def set_trainable_prototypes(self, prototypes: nn.Parameter) -> None:
+        self._prototypes = prototypes
+
+    def set_kmeans_prototypes(self, prototypes: nn.Parameter | None) -> None:
+        self._kmeans_prototypes = prototypes
+
     @property
     def prototypes(self) -> nn.Parameter:
         return self._kmeans_prototypes if self.mode.zero_shot else self._prototypes
