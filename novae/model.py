@@ -282,11 +282,13 @@ class Novae(L.LightningModule, PyTorchModelHubMixin):
             data = self.augmentation(data)
         return self.cell_embedder(data)
 
-    def forward(self, batch: dict[str, Batch]) -> dict[str, Tensor]:
-        return {key: self.encoder(self._embed_pyg_data(data)) for key, data in batch.items() if isinstance(data, Batch)}
+    def forward(self, batch: dict[str, Batch]) -> dict[str, tuple[Tensor, Tensor]]:
+        return {key: self.encoder(self._embed_pyg_data(data)) for key, data in batch.items()}
 
     def training_step(self, batch: dict[str, Batch], batch_idx: int):
-        z_dict: dict[str, Tensor] = self(batch)
+        z_dict = {
+            key: self.encoder.encode_graph(self._embed_pyg_data(data)) for key, data in batch.items()
+        }
         slide_id = batch["main"].get("slide_id", [None])[0]
 
         loss_c, loss_n, entropy_c, entropy_n = self.swav_head.forward(z_dict["main"], z_dict["view"], slide_id)
@@ -621,7 +623,7 @@ class Novae(L.LightningModule, PyTorchModelHubMixin):
 
         for batch in utils.tqdm(datamodule.predict_dataloader(), desc="Computing representations"):
             batch = self.transfer_batch_to_device(batch, self.device, dataloader_idx=0)
-            batch_repr: Tensor = self.encoder(self._embed_pyg_data(batch["main"]))
+            batch_repr: Tensor = self.encoder.encode_graph(self._embed_pyg_data(batch["main"]))
 
             representations.append(batch_repr.numpy(force=True))
 
