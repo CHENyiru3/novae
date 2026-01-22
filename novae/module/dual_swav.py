@@ -52,6 +52,10 @@ class DualSwavHead(L.LightningModule):
         self.swav_c.init_queue(slide_ids)
         self.swav_n.init_queue(slide_ids)
 
+    def kaiming_prototypes_initialization(self) -> None:
+        self.swav_c.kaiming_prototypes_initialization()
+        self.swav_n.kaiming_prototypes_initialization()
+
     def set_prototypes_requires_grad(self, value: bool) -> None:
         self.swav_c.prototypes.requires_grad_(value)
         self.swav_n.prototypes.requires_grad_(value)
@@ -68,6 +72,11 @@ class DualSwavHead(L.LightningModule):
 
     def reset_clustering(self, only_zero_shot: bool = False) -> None:
         self.swav_c.reset_clustering(only_zero_shot=only_zero_shot)
+        self.swav_n.reset_clustering(only_zero_shot=only_zero_shot)
+
+    def hierarchical_clustering(self) -> None:
+        self.swav_c.hierarchical_clustering()
+        self.swav_n.hierarchical_clustering()
 
     @property
     def prototypes(self) -> nn.Parameter:
