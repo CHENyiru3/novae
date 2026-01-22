@@ -89,6 +89,13 @@ class NovaeDataset(Dataset):
                 adata.obsp[Keys.ADJ_VIEW] = _to_adjacency_view(adjacency, self.n_hops_view)
                 adata.uns[Keys.NOVAE_UNS]["n_hops_view"] = self.n_hops_view
 
+            if (
+                Keys.TOPK_NEIGHBOR_INDICES not in adata.uns[Keys.NOVAE_UNS]
+                or Keys.TOPK_NEIGHBOR_DISTANCES not in adata.uns[Keys.NOVAE_UNS]
+                or adata.uns[Keys.NOVAE_UNS].get("k_p") != settings.k_p
+            ):
+                _cache_top_k_neighbors(adata, adjacency, settings.k_p)
+
             adata.obs[Keys.IS_VALID_OBS] = adata.obsp[Keys.ADJ_VIEW].sum(1).A1 > 0
 
         ratio_valid_obs = pd.concat([adata.obs[Keys.IS_VALID_OBS] for adata in self.adatas]).mean()
@@ -163,6 +170,9 @@ class NovaeDataset(Dataset):
         adata = self.adatas[adata_index]
         adjacency_local: csr_matrix = adata.obsp[Keys.ADJ_LOCAL]
         obs_indices = adjacency_local[obs_index].indices
+        obs_indices = obs_indices[obs_indices != obs_index]
+        if len(obs_indices) == 0:
+            obs_indices = np.array([obs_index])
 
         adjacency: csr_matrix = adata.obsp[Keys.ADJ]
         edge_index, edge_weight = from_scipy_sparse_matrix(adjacency[obs_indices][:, obs_indices])
@@ -177,6 +187,9 @@ class NovaeDataset(Dataset):
 
         x, genes_indices = self.anndata_torch[adata_index, obs_indices]
 
+        topk_indices = adata.uns[Keys.NOVAE_UNS][Keys.TOPK_NEIGHBOR_INDICES][obs_index]
+        topk_distances = adata.uns[Keys.NOVAE_UNS][Keys.TOPK_NEIGHBOR_DISTANCES][obs_index]
+
         return Data(
             x=x,
             edge_index=edge_index,
@@ -184,6 +197,8 @@ class NovaeDataset(Dataset):
             genes_indices=genes_indices,
             slide_id=adata.obs[Keys.SLIDE_ID].iloc[obs_index],
             histo_embeddings=histo_embeddings,
+            neighbor_indices=torch.tensor(topk_indices, dtype=torch.long),
+            neighbor_distances=torch.tensor(topk_distances, dtype=torch.float32),
         )
 
     def shuffle_obs_ilocs(self):
@@ -238,6 +253,25 @@ def _to_adjacency_local(adjacency: csr_matrix, n_hops_local: int) -> csr_matrix:
     for _ in range(n_hops_local - 1):
         adjacency_local = adjacency_local @ adjacency
     return adjacency_local.tocsr()
+
+
+def _cache_top_k_neighbors(adata: AnnData, adjacency: csr_matrix, k_p: int) -> None:
+    n_obs = adjacency.shape[0]
+    neighbor_indices = np.full((n_obs, k_p), -1, dtype=int)
+    neighbor_distances = np.full((n_obs, k_p), np.inf, dtype=np.float32)
+
+    for row_index in range(n_obs):
+        row = adjacency.getrow(row_index)
+        if row.nnz == 0:
+            continue
+        order = np.argsort(row.data)[:k_p]
+        n_neighbors = len(order)
+        neighbor_indices[row_index, :n_neighbors] = row.indices[order]
+        neighbor_distances[row_index, :n_neighbors] = row.data[order]
+
+    adata.uns[Keys.NOVAE_UNS][Keys.TOPK_NEIGHBOR_INDICES] = neighbor_indices
+    adata.uns[Keys.NOVAE_UNS][Keys.TOPK_NEIGHBOR_DISTANCES] = neighbor_distances
+    adata.uns[Keys.NOVAE_UNS]["k_p"] = k_p
 
 
 def _to_adjacency_view(adjacency: csr_matrix, n_hops_view: int) -> csr_matrix:
