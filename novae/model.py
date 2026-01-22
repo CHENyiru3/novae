@@ -8,6 +8,7 @@ import lightning as L
 import numpy as np
 import scanpy as sc
 import torch
+import torch.nn.functional as F
 from anndata import AnnData
 from huggingface_hub import PyTorchModelHubMixin
 from lightning.pytorch.callbacks import Callback
@@ -62,6 +63,11 @@ class Novae(L.LightningModule, PyTorchModelHubMixin):
         sensitivity_noise_std: float = 0.05,
         dropout_rate: float = 0.0,
         histo_embedding_size: int = 50,
+        lambda_couple: float = 0.0,
+        couple_sigma: float = 1.0,
+        couple_bidirectional: bool = False,
+        couple_temperature: float = 1.0,
+        couple_distance_bins: int = 5,
         pca_init_reference_index: int | None = None,
         scgpt_model_dir: str | None = None,
         var_names: list[str] | None = None,
@@ -90,6 +96,11 @@ class Novae(L.LightningModule, PyTorchModelHubMixin):
             sensitivity_noise_std: Standard deviation for the multiplicative for for the noise augmentation.
             dropout_rate: Dropout rate for the genes during augmentation.
             histo_embedding_size: Size of the H&E embeddings. Only used in multimodal mode.
+            lambda_couple: Weight of the coupling loss term added to the training loss.
+            couple_sigma: Standard deviation of the Gaussian kernel used for coupling weights.
+            couple_bidirectional: Whether to add the C→N coupling loss in addition to N→C.
+            couple_temperature: Temperature for the coupling log-softmax.
+            couple_distance_bins: Number of distance bins to log positive similarity diagnostics.
             pca_init_reference_index: Index of the `AnnData` object to use as reference for PCA components. If `None`, the `AnnData` with the highest number of genes is used.
             scgpt_model_dir: Path to a directory containing a scGPT checkpoint, i.e. a `vocab.json` and a `best_model.pt` file.
             var_names: Used when loading a pretrained model. Can also be used to specify the names of the variables to train on, e.g. to not consider low quality proteins whose intensity highly depends on the FOV.
@@ -272,7 +283,7 @@ class Novae(L.LightningModule, PyTorchModelHubMixin):
         return self.cell_embedder(data)
 
     def forward(self, batch: dict[str, Batch]) -> dict[str, Tensor]:
-        return {key: self.encoder(self._embed_pyg_data(data)) for key, data in batch.items()}
+        return {key: self.encoder(self._embed_pyg_data(data)) for key, data in batch.items() if isinstance(data, Batch)}
 
     def training_step(self, batch: dict[str, Batch], batch_idx: int):
         z_dict: dict[str, Tensor] = self(batch)
@@ -288,6 +299,169 @@ class Novae(L.LightningModule, PyTorchModelHubMixin):
         self._log_progress_bar("entropy_niche", entropy_n, on_epoch=False, prog_bar=False)
 
         return loss
+
+    def _maybe_compute_coupling_loss(self, batch: dict[str, Batch], z_dict: dict[str, Tensor]) -> Tensor:
+        if self.hparams.lambda_couple <= 0:
+            return z_dict["main"].new_tensor(0.0)
+
+        coupling_payload = batch.get("coupling")
+        if isinstance(coupling_payload, dict):
+            return self._compute_coupling_loss_from_dict(coupling_payload, z_dict)
+
+        if coupling_payload is None:
+            coupling_payload = batch.get("main")
+
+        if coupling_payload is None or not hasattr(coupling_payload, "coupling_anchor_indices"):
+            return z_dict["main"].new_tensor(0.0)
+
+        niche_embeddings = getattr(coupling_payload, "niche_embeddings", z_dict.get("main"))
+        intrinsic_embeddings = getattr(coupling_payload, "intrinsic_embeddings", z_dict.get("view", niche_embeddings))
+        anchor_indices = getattr(coupling_payload, "coupling_anchor_indices")
+        neighbor_indices = getattr(coupling_payload, "coupling_neighbor_indices")
+        distances = getattr(coupling_payload, "coupling_distances")
+
+        if anchor_indices is None or neighbor_indices is None or distances is None:
+            return z_dict["main"].new_tensor(0.0)
+
+        sigma = getattr(coupling_payload, "couple_sigma", self.hparams.couple_sigma)
+        bidirectional = getattr(coupling_payload, "couple_bidirectional", self.hparams.couple_bidirectional)
+        temperature = getattr(coupling_payload, "couple_temperature", self.hparams.couple_temperature)
+
+        anchor_indices = anchor_indices.to(niche_embeddings.device)
+        neighbor_indices = neighbor_indices.to(niche_embeddings.device)
+        distances = distances.to(niche_embeddings.device)
+
+        loss_value, metrics = coupling_loss(
+            niche_embeddings,
+            intrinsic_embeddings,
+            anchor_indices,
+            neighbor_indices,
+            distances,
+            sigma=sigma,
+            bidirectional=bidirectional,
+            temperature=temperature,
+        )
+
+        self.log(
+            "train/couple_loss",
+            loss_value,
+            on_epoch=True,
+            on_step=True,
+            batch_size=self.hparams.batch_size,
+            prog_bar=False,
+        )
+        if metrics:
+            for name, value in metrics.items():
+                self.log(
+                    f"train/{name}",
+                    value,
+                    on_epoch=True,
+                    on_step=True,
+                    batch_size=self.hparams.batch_size,
+                    prog_bar=False,
+                )
+
+        pos_similarity = torch.sum(
+            F.normalize(niche_embeddings[anchor_indices], dim=1)
+            * F.normalize(intrinsic_embeddings[neighbor_indices], dim=1),
+            dim=1,
+        )
+        self._log_coupling_similarity_bins(distances, pos_similarity)
+
+        return loss_value
+
+    def _compute_coupling_loss_from_dict(self, coupling_payload: dict[str, Tensor], z_dict: dict[str, Tensor]) -> Tensor:
+        required_keys = {"anchor_indices", "neighbor_indices", "distances"}
+        if not required_keys.issubset(coupling_payload):
+            return z_dict["main"].new_tensor(0.0)
+
+        niche_embeddings = coupling_payload.get("niche_embeddings", z_dict.get("main"))
+        intrinsic_embeddings = coupling_payload.get("intrinsic_embeddings", z_dict.get("view", niche_embeddings))
+        anchor_indices = coupling_payload["anchor_indices"]
+        neighbor_indices = coupling_payload["neighbor_indices"]
+        distances = coupling_payload["distances"]
+
+        sigma = coupling_payload.get("sigma", self.hparams.couple_sigma)
+        bidirectional = coupling_payload.get("bidirectional", self.hparams.couple_bidirectional)
+        temperature = coupling_payload.get("temperature", self.hparams.couple_temperature)
+
+        anchor_indices = anchor_indices.to(niche_embeddings.device)
+        neighbor_indices = neighbor_indices.to(niche_embeddings.device)
+        distances = distances.to(niche_embeddings.device)
+
+        loss_value, metrics = coupling_loss(
+            niche_embeddings,
+            intrinsic_embeddings,
+            anchor_indices,
+            neighbor_indices,
+            distances,
+            sigma=sigma,
+            bidirectional=bidirectional,
+            temperature=temperature,
+        )
+
+        self.log(
+            "train/couple_loss",
+            loss_value,
+            on_epoch=True,
+            on_step=True,
+            batch_size=self.hparams.batch_size,
+            prog_bar=False,
+        )
+        if metrics:
+            for name, value in metrics.items():
+                self.log(
+                    f"train/{name}",
+                    value,
+                    on_epoch=True,
+                    on_step=True,
+                    batch_size=self.hparams.batch_size,
+                    prog_bar=False,
+                )
+
+        pos_similarity = torch.sum(
+            F.normalize(niche_embeddings[anchor_indices], dim=1)
+            * F.normalize(intrinsic_embeddings[neighbor_indices], dim=1),
+            dim=1,
+        )
+        self._log_coupling_similarity_bins(distances, pos_similarity)
+
+        return loss_value
+
+    def _log_coupling_similarity_bins(self, distances: Tensor, similarities: Tensor) -> None:
+        num_bins = int(self.hparams.couple_distance_bins)
+        if num_bins <= 0 or distances.numel() == 0:
+            return
+
+        dist_min = distances.min()
+        dist_max = distances.max()
+        if dist_min == dist_max:
+            self.log(
+                "train/couple/sim_bin_0",
+                similarities.mean(),
+                on_epoch=True,
+                on_step=True,
+                batch_size=self.hparams.batch_size,
+                prog_bar=False,
+            )
+            return
+
+        edges = torch.linspace(dist_min, dist_max, steps=num_bins + 1, device=distances.device)
+        bin_indices = torch.bucketize(distances, edges, right=False) - 1
+        bin_indices = bin_indices.clamp(0, num_bins - 1)
+
+        for bin_id in range(num_bins):
+            mask = bin_indices == bin_id
+            if not mask.any():
+                continue
+            self.log(
+                f"train/couple/sim_bin_{bin_id}",
+                similarities[mask].mean(),
+                on_epoch=True,
+                on_step=True,
+                batch_size=self.hparams.batch_size,
+                prog_bar=False,
+            )
 
     def on_train_epoch_start(self):
         self.training = True
